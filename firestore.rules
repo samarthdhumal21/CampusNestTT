@@ -1,0 +1,194 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -------------------------------------------------------------
+    // SECURITY HELPER FUNCTIONS
+    // -------------------------------------------------------------
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isUser(uid) {
+      return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    function getUserData(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        getUserData(request.auth.uid).role == 'admin';
+    }
+
+    function isApprovedOwner() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        getUserData(request.auth.uid).role == 'owner' &&
+        getUserData(request.auth.uid).ownerStatus == 'approved';
+    }
+
+    function getOwnerType() {
+      return getUserData(request.auth.uid).ownerType;
+    }
+
+    // -------------------------------------------------------------
+    // PART 1 & 2: USERS COLLECTION
+    // fields: uid, displayName, email, photoURL, role, ownerType, ownerStatus, createdAt
+    // -------------------------------------------------------------
+    match /users/{uid} {
+      // Rule: A user can read their own document. Admins can read all.
+      // Nobody else can read another user's document, and emails are never exposed to students or owners.
+      allow read: if isUser(uid) || isAdmin();
+
+      // Rule: A user can create ONLY their own users/{uid} document,
+      // with role in ["student","owner"], ownerType valid for that role,
+      // and ownerStatus "none" for students or "pending" for owners.
+      // Creating role "admin" is rejected. Store nothing else personal.
+      allow create: if isUser(uid) &&
+        request.resource.data.keys().hasOnly(['uid', 'displayName', 'email', 'photoURL', 'role', 'ownerType', 'ownerStatus', 'createdAt']) &&
+        request.resource.data.uid == uid &&
+        (
+          // Student role
+          (request.resource.data.role == 'student' &&
+           request.resource.data.ownerType == null &&
+           request.resource.data.ownerStatus == 'none') ||
+          // Owner role
+          (request.resource.data.role == 'owner' &&
+           request.resource.data.ownerType in ['pg', 'hostel', 'mess'] &&
+           request.resource.data.ownerStatus == 'pending')
+        );
+
+      // Rule: After creation, a user cannot change role, ownerType or ownerStatus. Only an admin can.
+      // Migration exception: if an existing user has role "owner" but no ownerType,
+      // allow them to set ownerType once. Existing students and admins keep working.
+      allow update: if isAdmin() || (
+        isUser(uid) &&
+        request.resource.data.keys().hasOnly(['uid', 'displayName', 'email', 'photoURL', 'role', 'ownerType', 'ownerStatus', 'createdAt']) &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.ownerStatus == resource.data.ownerStatus &&
+        (
+          request.resource.data.ownerType == resource.data.ownerType ||
+          (resource.data.role == 'owner' &&
+           (!('ownerType' in resource.data) || resource.data.ownerType == null) &&
+           request.resource.data.ownerType in ['pg', 'hostel', 'mess'])
+        )
+      );
+
+      // Admin only delete
+      allow delete: if isAdmin();
+
+      // Rule: Students can read public listings and write only their own shortlist
+      match /shortlist/{listingId} {
+        allow read, write: if isUser(uid);
+      }
+    }
+
+    // -------------------------------------------------------------
+    // COLLEGES: Public read for signed-in and signed-out users
+    // -------------------------------------------------------------
+    match /colleges/{collegeId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // -------------------------------------------------------------
+    // ACCOMMODATIONS (PG & Hostel listings)
+    // -------------------------------------------------------------
+    match /accommodations/{listingId} {
+      // Signed-out & signed-in users can read approved public listings.
+      // Owners can read their own pending/rejected listings. Admins can read all.
+      allow read: if (!('status' in resource.data) || resource.data.status == 'approved') ||
+                     (isAuthenticated() && resource.data.ownerId == request.auth.uid) ||
+                     isAdmin();
+
+      // Owners can create only their own listings, only when approved, and matching type:
+      // "pg" owners create accommodations of type PG; "hostel" owners create Hostel.
+      // Listing must start with status "pending review" and "owner-submitted, not verified".
+      allow create: if isAdmin() || (
+        isApprovedOwner() &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.resource.data.status == 'pending review' &&
+        request.resource.data.verificationBadge == 'owner-submitted, not verified' &&
+        (
+          (getOwnerType() == 'pg' && (request.resource.data.type in ['Single Room', 'Shared Room (2-Sharing)', 'Shared Room (3-Sharing)', '1RK / 1BHK Flat', 'PG'])) ||
+          (getOwnerType() == 'hostel' && (request.resource.data.type in ['Student Hostel / PG', 'Hostel', 'Shared Room (2-Sharing)', 'Shared Room (3-Sharing)']))
+        )
+      );
+
+      // Owner can edit only their own listing, only when approved.
+      // Cannot approve or change badge themselves:
+      allow update: if isAdmin() || (
+        isApprovedOwner() &&
+        resource.data.ownerId == request.auth.uid &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.resource.data.status == 'pending review' &&
+        request.resource.data.verificationBadge == 'owner-submitted, not verified'
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // -------------------------------------------------------------
+    // MESS LISTINGS
+    // -------------------------------------------------------------
+    match /messListings/{messId} {
+      allow read: if (!('status' in resource.data) || resource.data.status == 'approved') ||
+                     (isAuthenticated() && resource.data.ownerId == request.auth.uid) ||
+                     isAdmin();
+
+      // Only approved "mess" owners can create mess listings
+      allow create: if isAdmin() || (
+        isApprovedOwner() &&
+        getOwnerType() == 'mess' &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.resource.data.status == 'pending review' &&
+        request.resource.data.verificationBadge == 'owner-submitted, not verified'
+      );
+
+      allow update: if isAdmin() || (
+        isApprovedOwner() &&
+        getOwnerType() == 'mess' &&
+        resource.data.ownerId == request.auth.uid &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.resource.data.status == 'pending review' &&
+        request.resource.data.verificationBadge == 'owner-submitted, not verified'
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // -------------------------------------------------------------
+    // UNIFIED OWNER LISTINGS SUBMISSIONS
+    // -------------------------------------------------------------
+    match /listings/{listingId} {
+      allow read: if (!('status' in resource.data) || resource.data.status == 'approved') ||
+                     (isAuthenticated() && resource.data.ownerId == request.auth.uid) ||
+                     isAdmin();
+
+      allow create: if isAdmin() || (
+        isApprovedOwner() &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.resource.data.status == 'pending review' &&
+        request.resource.data.verificationBadge == 'owner-submitted, not verified' &&
+        (
+          (getOwnerType() == 'pg' && (request.resource.data.ownerType == 'pg' || request.resource.data.type in ['Single Room', 'Shared Room (2-Sharing)', 'Shared Room (3-Sharing)', '1RK / 1BHK Flat'])) ||
+          (getOwnerType() == 'hostel' && (request.resource.data.ownerType == 'hostel' || request.resource.data.type in ['Student Hostel / PG', 'Hostel'])) ||
+          (getOwnerType() == 'mess' && request.resource.data.ownerType == 'mess')
+        )
+      );
+
+      allow update: if isAdmin() || (
+        isApprovedOwner() &&
+        resource.data.ownerId == request.auth.uid &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.resource.data.status == 'pending review' &&
+        request.resource.data.verificationBadge == 'owner-submitted, not verified'
+      );
+
+      allow delete: if isAdmin();
+    }
+  }
+}
